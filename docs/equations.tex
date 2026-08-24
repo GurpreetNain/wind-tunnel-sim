@@ -1,0 +1,524 @@
+%==============================================================================
+%  DeltaV Interceptor -- Actuator & Aerodynamic Block Equations
+%
+%  Transcribed directly from the implementation:
+%      src/actuators/rotors.py
+%      src/actuators/lifting_body.py
+%      src/actuators/elevons.py
+%
+%  Every equation below is the one the simulator actually evaluates, including
+%  the regularisation and blending terms. Compile with pdflatex or xelatex.
+%==============================================================================
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.4cm]{geometry}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+% xcolor must be loaded ONCE with every option it needs -- loading it twice with
+% different options is an option clash, and hyperref cannot reference a colour
+% that does not exist yet, so xcolor and the colour definition both come first.
+\usepackage[table,usenames,dvipsnames]{xcolor}
+\definecolor{blockrule}{RGB}{29,93,135}
+
+\usepackage{titlesec}
+\usepackage{enumitem}
+\usepackage[colorlinks=true,linkcolor=blockrule,citecolor=blockrule,
+            urlcolor=blockrule]{hyperref}
+
+\titleformat{\section}{\Large\bfseries\color{blockrule}}{\thesection}{0.7em}{}
+\titleformat{\subsection}{\large\bfseries}{\thesubsection}{0.6em}{}
+
+\newcommand{\vect}[1]{\bm{#1}}
+\newcommand{\unit}[1]{\hat{\bm{#1}}}
+\newcommand{\dd}{\,\mathrm{d}}
+\newcommand{\Rey}{\mathrm{Re}}
+\newcommand{\clip}{\operatorname{clip}}
+\newcommand{\sgn}{\operatorname{sgn}}
+\newcommand{\atantwo}{\operatorname{atan2}}
+\newcommand{\interp}{\operatorname{interp}}
+
+\title{\textbf{DeltaV Interceptor}\\[2mm]
+\large Governing Equations of the Rotor, Lifting-Body and Elevon Blocks}
+\author{6\,DOF Actuator Testbench}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+This document sets out the complete set of equations evaluated by the three
+aerodynamic/propulsive blocks of the DeltaV Interceptor 6\,DOF model. The
+vehicle is a quad tilt-rotor flying wing: four independently tilting rotors on
+an asymmetric H-frame, a swept tailless wing with two elevon channels, and no
+separate control surfaces beyond those. Sign conventions follow the body frame
+$x$ forward, $y$ right, $z$ down (NED). All equations are transcribed from the
+implementation, including the regularisation, blending and validity-fade terms
+that make the model well behaved at hover, through stall, and beyond the
+tabulated data envelope.
+\end{abstract}
+
+%==============================================================================
+\section*{Nomenclature}
+\addcontentsline{toc}{section}{Nomenclature}
+
+\begin{longtable}{@{}p{2.6cm}p{6.1cm}p{2.4cm}p{4.6cm}@{}}
+\toprule
+\textbf{Symbol} & \textbf{Meaning} & \textbf{Symbol} & \textbf{Meaning}\\
+\midrule
+\endhead
+$u,v,w$            & body-frame CG velocity            & $p,q,r$          & body angular rates \\
+$V_a$              & true airspeed                     & $\bar q$         & freestream dynamic pressure \\
+$\alpha,\beta$     & body incidence, sideslip          & $\alpha_w$       & wing incidence, post-downwash \\
+$\varepsilon$      & rotor downwash angle              & $\bar q_w$       & dynamic pressure at the wing \\
+$\rho$             & air density                       & $S,b,\bar c$     & wing area, span, mean chord \\
+$A\!R$             & aspect ratio                      & $e$              & Oswald efficiency \\
+$n_i$              & rotor speed, rev\,s$^{-1}$        & $\lambda_i$      & rotor tilt angle \\
+$D$                & rotor diameter                    & $R$              & rotor radius, $D/2$ \\
+$A$                & rotor disc area                   & $s_i$            & spin sign, $\pm1$ \\
+$x_i,y_i$          & rotor station about the CG        & $J_i$            & advance ratio \\
+$C_T,C_Q$          & thrust, torque coefficients       & $T_i,Q_i$        & rotor thrust, torque \\
+$\mu_i$            & in-plane advance ratio            & $\alpha_i$       & disc incidence \\
+$I_p$              & rotor polar inertia               & $\sigma_b,C_{d}$ & blade solidity, blade drag \\
+$\delta_1,\delta_2$& elevon channel deflections        & $\delta_e,\delta_a$ & pitch, roll elevon inputs \\
+$\eta$             & DATCOM deflection efficiency      & $y_{\!e}$        & elevon spanwise centroid \\
+$\alpha_{s}$       & stall angle                       & $\sigma$         & stall blend fraction \\
+$x_{np},x_{cg}$    & neutral point, CG station         & $k_w$            & wing activity fraction \\
+$V_{\!\mathrm{reg}}$ & airspeed regularisation floor   & $n_{\mathrm{reg}}$ & rotor-speed floor \\
+\bottomrule
+\end{longtable}
+
+\noindent
+\textbf{Regularisation constants.} $V_{\!\mathrm{reg}}=5\ \mathrm{m\,s^{-1}}$,
+$V_{db}=0.5\ \mathrm{m\,s^{-1}}$ (hover deadband),
+$\epsilon_u=1\ \mathrm{m\,s^{-1}}$, $n_{\mathrm{reg}}=5\ \mathrm{rev\,s^{-1}}$,
+$\varepsilon_{\max}=85^\circ$, $\Delta_{ps}=2^\circ$ (post-stall blend offset).
+
+%==============================================================================
+\section{Rotor Block}
+\emph{Source:} \texttt{src/actuators/rotors.py}
+
+\medskip\noindent
+Four rotors, indexed $i=1\ldots4$ in the order
+$[\,\mathrm{FR},\ \mathrm{AL},\ \mathrm{FL},\ \mathrm{AR}\,]$
+(front-right, aft-left, front-left, aft-right), with spin signs
+$s_i=[+1,+1,-1,-1]$. The tilt convention is
+$\lambda=0$ for hover (thrust along $-z_b$) and $\lambda=\pi/2$ for cruise
+(thrust along $+x_b$), giving the shaft unit vector
+
+\begin{equation}
+\unit n_i =
+\begin{bmatrix}\sin\lambda_i\\[1mm] 0 \\[1mm] -\cos\lambda_i\end{bmatrix}.
+\end{equation}
+
+\subsection{Hub kinematics}
+Each hub is offset from the CG, so it sees the CG velocity plus the rigid-body
+rotation carrying it around, $\vect V_{h,i}=\vect V_{cg}+\vect\Omega\times\vect r_i$
+with $\vect r_i=(x_i,y_i,0)$:
+
+\begin{equation}
+\vect V_{h,i}=
+\begin{bmatrix}
+u - r\,y_i \\
+v + r\,x_i \\
+w + p\,y_i - q\,x_i
+\end{bmatrix}.
+\end{equation}
+
+The axial inflow is its projection onto the shaft, $V_{ax,i}=\vect V_{h,i}\cdot\unit n_i$.
+Since $\unit n_i$ has no $y$-component (tilt is single-axis about body $y$),
+
+\begin{equation}
+\boxed{\;
+V_{ax,i}=\bigl(u-r\,y_i\bigr)\sin\lambda_i-\bigl(w+p\,y_i-q\,x_i\bigr)\cos\lambda_i \;}
+\end{equation}
+
+\subsection{Advance ratio and coefficient lookup}
+\begin{equation}
+J_i=\frac{V_{ax,i}}{\max\!\left(n_i,\,n_{\mathrm{reg}}\right)D}
+\end{equation}
+
+$C_T$ and $C_Q$ are tabulated against $J$. Below the table the lookup clamps
+(correct: static thrust). \emph{Above} the last tabulated point $J_N$ the table
+is continued linearly into the windmill-brake regime rather than clamped, so a
+propeller past its zero-thrust advance ratio correctly produces negative thrust:
+
+\begin{equation}
+C(J)=
+\begin{cases}
+\interp\!\left(J;\,J_k,\,C_k\right), & J\le J_N\\[3mm]
+\max\!\Bigl(C_N+m\,\min\!\left(J-J_N,\ \Delta J_{\max}\right),\ C_{\mathrm{floor}}\Bigr), & J>J_N
+\end{cases}
+\qquad
+m=\frac{C_N-C_{N-1}}{J_N-J_{N-1}}
+\end{equation}
+
+with $\Delta J_{\max}=1.0$ and $C_{\mathrm{floor}}=-0.06$.
+
+\subsection{Thrust, torque and their moments}
+\begin{align}
+T_i&=C_T(J_i)\,\rho\,n_i^{2}D^{4}, &
+Q_i&=C_Q(J_i)\,\rho\,n_i^{2}D^{5}
+\end{align}
+
+Resolved into the body frame, $\vect F_{T,i}=T_i\unit n_i$:
+\begin{align}
+F_{Tx,i}&=T_i\sin\lambda_i, &
+F_{Tz,i}&=-T_i\cos\lambda_i
+\end{align}
+
+The thrust moments follow from $\vect r_i\times\vect F_{T,i}$:
+\begin{align}
+M_{Tx,i}&=-y_i\,T_i\cos\lambda_i &&\text{(roll)}\\
+M_{Ty,i}&=+x_i\,T_i\cos\lambda_i &&\text{(pitch)}\\
+M_{Tz,i}&=-y_i\,T_i\sin\lambda_i &&\text{(yaw)}
+\end{align}
+
+The motor reaction torque acts along $-s_i\,Q_i\unit n_i$:
+\begin{align}
+M_{Qx,i}&=-s_i\,Q_i\sin\lambda_i, &
+M_{Qz,i}&=+s_i\,Q_i\cos\lambda_i
+\end{align}
+
+\subsection{Oblique-flow correction (normal force and P-factor)}
+The axial table cannot see the in-plane component of the hub velocity. Define
+
+\begin{align}
+\vect V_{\perp,i}&=\vect V_{h,i}-V_{ax,i}\,\unit n_i, &
+\unit d_i&=\frac{\vect V_{\perp,i}}{\lVert\vect V_{\perp,i}\rVert}
+\end{align}
+
+\begin{equation}
+\alpha_i=
+\begin{cases}
+0, & \lVert\vect V_{\perp,i}\rVert<10^{-9}\\[1mm]
+\atantwo\!\left(\lVert\vect V_{\perp,i}\rVert,\ V_{ax,i}\right), & \text{otherwise}
+\end{cases}
+\qquad
+\mu_i=\frac{\lVert\vect V_{\perp,i}\rVert}{\Omega_i R},
+\quad \Omega_i=2\pi\max(n_i,n_{\mathrm{reg}})
+\end{equation}
+
+The disc dynamic pressure and the singular-term guard are
+\begin{align}
+q_i&=\tfrac12\rho\,\max\!\left(\lVert\vect V_{h,i}\rVert,\ V_{\!\mathrm{reg}}\right)^{2}, &
+J_{s}&=\sgn(J_i)\max\!\left(|J_i|,\ J_{\mathrm{reg}}\right)
+\end{align}
+
+The mean blade lift coefficient is
+\begin{equation}
+\bar C_{l,i}=\frac{3J_i}{2\pi}
+\left[\frac{2}{\sigma_b q_i A}\cdot\frac{J_i}{\pi}\,T_i+C_{d}\right]
+\end{equation}
+
+and the normal force and P-factor moment magnitudes, with $a=2\pi$ the
+thin-airfoil lift-curve slope, are
+\begin{align}
+P_{N,i}&=\frac{\sigma_b q_i A}{2}
+\left[\bar C_{l,i}
++\frac{a J_i}{2\pi}\ln\!\left(1+\Bigl(\frac{\pi}{J_{s}}\Bigr)^{2}\right)
++\frac{\pi}{J_{s}}C_{d}\right]\alpha_i\,\Lambda_i\\[2mm]
+N_{P,i}&=-\frac{\sigma_b q_i A R}{2}
+\left[\frac{2\pi}{3J_{s}}\bar C_{l,i}
++\frac{a}{2}\left(1-\Bigl(\frac{J_{s}}{\pi}\Bigr)^{2}
+\ln\!\left(1+\Bigl(\frac{\pi}{J_{s}}\Bigr)^{2}\right)\right)
+-\frac{\pi}{J_{s}}C_{d}\right]\alpha_i\,\Lambda_i
+\end{align}
+
+Both are gated by a combined validity factor $\Lambda_i$ built from a
+magnitude ramp (so a vanishing $\vect V_\perp$ cannot hand the correction a
+numerically arbitrary direction, since $\alpha_i$ is an \emph{angle} and can sit
+at $90^\circ$ for an arbitrarily small $\vect V_\perp$) and an in-plane advance
+ratio fade (the linear model is trusted only below $\mu\approx0.3$):
+
+\begin{equation}
+\Lambda_i=
+\underbrace{\clip\!\left(\frac{\lVert\vect V_{\perp,i}\rVert}{V_{\!\mathrm{reg}}},0,1\right)}_{\text{magnitude ramp}}
+\cdot
+\underbrace{\clip\!\left(1-\frac{\mu_i-0.3}{0.4-0.3},\,0,\,1\right)}_{\text{validity fade}}
+\end{equation}
+
+\begin{align}
+\vect F_{N,i}&=P_{N,i}\,\unit d_i, &
+\vect M_{N,i}&=s_i\,N_{P,i}\,\unit d_i
+\end{align}
+
+\subsection{Gyroscopic coupling}
+Each shaft carries angular momentum $\vect h_i=I_p\,(2\pi n_i)\,s_i\,\unit n_i$.
+With the shaft angular velocity including the tilt rate,
+$\vect\omega_{s,i}=\vect\omega_{b}+\dot\lambda_i\,\unit e_{\mathrm{tilt}}$,
+
+\begin{equation}
+\vect M_{\mathrm{gyro}}=-\sum_{i=1}^{4}\vect\omega_{s,i}\times\vect h_i
+\end{equation}
+
+\subsection{Block totals}
+\begin{align}
+\vect F_{\mathrm{rot}}&=\sum_{i=1}^{4}
+\begin{bmatrix}F_{Tx,i}+F_{Nx,i}\\ F_{Ny,i}\\ F_{Tz,i}+F_{Nz,i}\end{bmatrix}\\[2mm]
+\vect M_{\mathrm{rot}}&=\sum_{i=1}^{4}
+\begin{bmatrix}
+M_{Tx,i}+M_{Nx,i}+M_{Qx,i}\\
+M_{Ty,i}+M_{Ny,i}\\
+M_{Tz,i}+M_{Nz,i}+M_{Qz,i}
+\end{bmatrix}+\vect M_{\mathrm{gyro}}
+\end{align}
+
+The front-pair thrust handed to the wing block (Sec.~\ref{sec:downwash}) is
+\begin{equation}
+T_f=T_1+T_3
+\end{equation}
+
+%==============================================================================
+\section{Lifting-Body Block}
+\emph{Source:} \texttt{src/actuators/lifting\_body.py}
+
+\subsection{Air data}
+\begin{align}
+V_a&=\sqrt{u^{2}+v^{2}+w^{2}}, &
+\beta&=\arcsin\!\left(\clip\!\left(\frac{v}{V_a},-1,1\right)\right), &
+\bar q&=\tfrac12\rho V_a^{2}
+\end{align}
+
+The incidence $\alpha$ is regularised, because $\atantwo(w,u)$ is genuinely
+singular as $V_a\to0$ (the direction of a near-zero vector is not physically
+meaningful) and has a branch cut at $w=0,\ u<0$. Two devices are used: a
+softplus floor on $u$, and a linear blend toward a bounded reference:
+
+\begin{align}
+u_{f}&=\tfrac12\!\left(u+\sqrt{u^{2}+\epsilon_u^{2}}\right)
+&&\text{smooth }\max(u,0),\ \text{never exactly }0\\
+\alpha_{\mathrm{raw}}&=\atantwo\!\left(w,\ u_f\right), &
+\alpha_{\mathrm{reg}}&=\atantwo\!\left(w,\ V_{\!\mathrm{reg}}\right)\\
+k&=\min\!\left(V_a/V_{\!\mathrm{reg}},\,1\right), &
+\alpha&=(1-k)\,\alpha_{\mathrm{reg}}+k\,\alpha_{\mathrm{raw}}
+\end{align}
+
+\subsection{Wing activity}
+The wing's entire contribution is faded out at negligible airspeed, with a hard
+floor below the deadband so no self-feeding drift can survive at true hover:
+\begin{equation}
+k_w(V_a)=
+\begin{cases}
+0, & V_a<V_{db}\\
+\min\!\left(V_a/V_{\!\mathrm{reg}},\,1\right), & \text{otherwise}
+\end{cases}
+\end{equation}
+
+\subsection{Rotor downwash}\label{sec:downwash}
+Only the component of front-rotor thrust still pointing \emph{through} the wing
+contributes; the $\cos\lambda_f$ gate fades this to zero at cruise tilt:
+\begin{align}
+T_{f\perp}&=\max\!\left(T_f\cos\lambda_f,\ 0\right), &
+w_i&=\sqrt{\frac{T_{f\perp}}{2\rho A}} &&\text{(momentum theory)}
+\end{align}
+
+\begin{equation}
+\varepsilon=
+\begin{cases}
+0, & V_a<V_{db}\\[1mm]
+\clip\!\left(\dfrac{k_\varepsilon\,w_i}{\max(V_a,V_{\!\mathrm{reg}})},
+\ -\varepsilon_{\max},\ \varepsilon_{\max}\right), & \text{otherwise}
+\end{cases}
+\end{equation}
+
+\begin{equation}
+\bar q_w=
+\begin{cases}
+\bar q\left(1+\dfrac{k_q\,T_{f\perp}}{\bar q\,A}\right), & \bar q>10^{-9}\\[3mm]
+\dfrac{k_q\,T_{f\perp}}{A}, & \text{hover, no freestream}
+\end{cases}
+\qquad\Longrightarrow\qquad
+\boxed{\;\alpha_w=\alpha-\varepsilon\;}
+\end{equation}
+
+\subsection{Lift and drag: attached, separated, and the blend}
+The stall blend is a smooth two-sided logistic, $0$ pre-stall and $1$ post-stall:
+\begin{equation}
+\sigma(\alpha_w)=\frac{1+e^{z_1}+e^{z_2}}{\left(1+e^{z_1}\right)\left(1+e^{z_2}\right)},
+\qquad
+z_1=-M\!\left(\alpha_w-\alpha_s^{*}\right),\quad
+z_2=+M\!\left(\alpha_w+\alpha_s^{*}\right)
+\end{equation}
+with $\alpha_s^{*}=\alpha_{s}+\Delta_{ps}$. The offset places the \emph{peak} of
+the resulting lift curve on $\alpha_s$; a blend centred on $\alpha_s$ would put
+$\sigma=\tfrac12$ at the peak and roughly halve $C_{L,\max}$.
+
+\paragraph{Attached branch.} Measured polar data where it is trusted, parametric
+model outside it. With table range $[\alpha_{\min},\alpha_{\max}]$ and taper
+width $\Delta_b$, the trust weight is a cosine ease:
+\begin{equation}
+W=
+\begin{cases}
+1, & \alpha_{\min}\le\alpha_w\le\alpha_{\max}\\[1mm]
+0, & d\ge\Delta_b\\[1mm]
+\tfrac12-\tfrac12\cos\!\left(\pi\left(1-d/\Delta_b\right)\right), & \text{otherwise}
+\end{cases}
+\end{equation}
+where $d$ is the distance past whichever edge was crossed. The parametric
+partner is
+\begin{align}
+C_{L}^{\,\mathrm{par}}&=C_{L0}+C_{L\alpha}\,\alpha_w, &
+C_{D}^{\,\mathrm{par}}&=C_{Dp}+\frac{\bigl(C_{L}^{\,\mathrm{par}}\bigr)^{2}}{\pi e\,A\!R}
+\end{align}
+and the attached values are $C^{\,\mathrm{att}}=W\,C^{\,\mathrm{tab}}+(1-W)\,C^{\,\mathrm{par}}$.
+
+\paragraph{Separated branch.} A stalled wing behaves as a flat plate carrying a
+force normal to its surface, with the finite-aspect-ratio normal-force
+coefficient (Hoerner correlation)
+\begin{equation}
+C_N=1.11+0.018\,A\!R
+\end{equation}
+\begin{align}
+C_{L}^{\,\mathrm{sep}}&=C_N\sin\alpha_w\cos\alpha_w, &
+C_{D}^{\,\mathrm{sep}}&=C_{Dp}+C_N\sin^{2}\alpha_w
+\end{align}
+so $C_L\to0$ and $C_D\to C_N$ at $\alpha_w=90^\circ$, both correct.
+
+\paragraph{Result.} Stall is applied once, identically for either data source,
+and the non-lifting airframe drag is added on top:
+\begin{align}
+C_L&=(1-\sigma)\,C_{L}^{\,\mathrm{att}}+\sigma\,C_{L}^{\,\mathrm{sep}}\\
+C_D&=(1-\sigma)\,C_{D}^{\,\mathrm{att}}+\sigma\,C_{D}^{\,\mathrm{sep}}
++\underbrace{C_{D,\mathrm{airframe}}}_{\text{fuselage, nacelles, booms}}
+\end{align}
+
+\subsection{Moment coefficients}
+With $V_s=\max(V_a,V_{\!\mathrm{reg}})$,
+\begin{align}
+C_m&=C_{m0}+C_{m\alpha}\alpha_w+C_{mq}\frac{\bar c}{2V_s}\,q\\
+C_l&=C_{l\beta}\,\beta+C_{lp}\frac{b}{2V_s}\,p\\
+C_n&=C_{n\beta}\,\beta+C_{nr}\frac{b}{2V_s}\,r
+\end{align}
+
+\subsection{Forces and moments}
+\begin{align}
+L&=k_w\,\bar q_w S\left(C_L+C_{Lq}\frac{\bar c}{2V_s}q\right), &
+D&=k_w\,\bar q_w S\,C_D, &
+Y&=k_w\,\bar q_w S\,C_{Y\beta}\,\beta
+\end{align}
+
+The pitching moment is taken about the CG as
+$\vect r_{cg\to np}\times\vect F$. With stations measured aft from the nose the
+neutral point lies at $-(x_{np}-x_{cg})$ along body $+x$, leaving
+$M_y=(x_{np}-x_{cg})F_z$, where $F_z$ is the \emph{body-axis normal force}, not
+the wind-axis lift:
+\begin{equation}
+F_{z,w}=-\left(L\cos\alpha_w+D\sin\alpha_w\cos\beta+Y\sin\alpha_w\sin\beta\right)
+\end{equation}
+\begin{align}
+M_x&=k_w\,\bar q_w S b\,C_l\\
+M_y&=\underbrace{k_w\,\bar q_w S\bar c\,C_{m0}}_{\text{zero-lift couple}}
++\underbrace{\left(x_{np}-x_{cg}\right)F_{z,w}}_{\text{NP lever arm}}
++\underbrace{k_w\,\bar q_w S\bar c\,C_{mq}\frac{\bar c}{2V_s}q}_{\text{pitch damping}}\\
+M_z&=k_w\,\bar q_w S b\,C_n
+\end{align}
+
+\noindent\textbf{Note.} $C_{m\alpha}$ is computed but deliberately \emph{not}
+added to $M_y$: the neutral-point lever arm already \emph{is} the
+$\alpha$-dependent pitching moment, and including both would double-count it.
+The same reasoning applies to yaw, where $C_{n\beta}$ carries the whole
+weathercock effect and no separate sideforce-times-arm term is added.
+
+\subsection{Projection to body axes}
+The wind-axis forces are rotated through $\alpha_w$ and $\beta$:
+\begin{align}
+F_x&=L\sin\alpha_w-D\cos\alpha_w\cos\beta-Y\cos\alpha_w\sin\beta\\
+F_y&=Y\cos\beta-D\sin\beta\\
+F_z&=-L\cos\alpha_w-D\sin\alpha_w\cos\beta-Y\sin\alpha_w\sin\beta
+\end{align}
+
+The moments are passed through \emph{unrotated}: $C_l$, $C_m$, $C_n$ and the
+lever-arm term are body-axis quantities by definition ($C_{lp}$ multiplies body
+roll rate $p$, $C_{nr}$ multiplies body yaw rate $r$), so applying the
+wind-to-body rotation a second time would be incorrect.
+
+%==============================================================================
+\section{Elevon Block}
+\emph{Source:} \texttt{src/actuators/elevons.py}
+
+\subsection{Channel split}
+The two physical surfaces are decomposed into a symmetric (pitch) and a
+differential (roll) input:
+\begin{align}
+\delta_e&=\tfrac12\left(\delta_1+\delta_2\right) &&\text{pitch}\\
+\delta_a&=\tfrac12\left(\delta_2-\delta_1\right) &&\text{roll}
+\end{align}
+
+\subsection{Effectiveness}
+Large-deflection efficiency is interpolated from a DATCOM table,
+$\eta(\delta)=\interp\!\left(|\delta|;\ \eta_{\mathrm{tab}}\right)$.
+This is then knocked down by the wing's own separation state, using the
+\emph{same} $\sigma$ as the lifting-body block: a trailing-edge surface only
+works while the flow ahead of it is attached.
+\begin{equation}
+k_{\mathrm{auth}}=1-\left(1-\eta_{ps}\right)\sigma(\alpha_w),
+\qquad \eta_{ps}=0.15
+\end{equation}
+\begin{align}
+\eta_e&\leftarrow\eta(\delta_e)\,k_{\mathrm{auth}}, &
+\eta_a&\leftarrow\eta(\delta_a)\,k_{\mathrm{auth}}
+\end{align}
+
+A hard operating limit is applied separately: at or above the stall cap,
+trailing-edge-down deflection is forbidden, since it would push the already
+near-separated aft wing further past stall,
+\begin{equation}
+\delta_e\leftarrow\max\left(\delta_e,\,0\right)
+\qquad\text{if}\qquad \alpha_w\ge\alpha_{s}
+\end{equation}
+
+\subsection{Incremental forces and moments}
+Evaluated in the \emph{slipstream-corrected} $\bar q_w$ and $\alpha_w$, since the
+elevons sit in the rotor wash rather than in the freestream:
+\begin{align}
+\Delta L&=-C_{L\delta_e}\,\eta_e\,\delta_e\,\bar q_w S
+&&\text{lift loss from deflection}\\
+\Delta D_e&=\bar q_w S\,k_e\left(\eta_e\delta_e\right)^{2}
+&&\text{airbrake drag}
+\end{align}
+\begin{align}
+F_x&=\Delta L\sin\alpha_w-\Delta D_e\cos\alpha_w\\
+F_y&=0\\
+F_z&=-\Delta L\cos\alpha_w-\Delta D_e\sin\alpha_w
+\end{align}
+\begin{align}
+M_x&=2\,\bar q_w S\,C_{L\delta_e}\,\eta_a\,\delta_a\,y_{\!e} &&\text{roll}\\
+M_y&=C_{m\delta_e}\,\eta_e\,\delta_e\,\bar q_w S\,\bar c &&\text{pitch}\\
+M_z&=0 &&\text{(finless airframe, no rudder)}
+\end{align}
+
+%==============================================================================
+\section{Assembly}
+The three blocks are summed once, in body axes, and passed to the rigid-body
+equations. Gravity enters the force sum only, never the moment sum, which is
+equivalent to assuming the reference point coincides with the CG:
+\begin{align}
+\sum\vect F&=\vect F_{\mathrm{rot}}+\vect F_{\mathrm{wing}}+\vect F_{\mathrm{elev}}\\
+\sum\vect M&=\vect M_{\mathrm{rot}}+\vect M_{\mathrm{wing}}+\vect M_{\mathrm{elev}}
+\end{align}
+\begin{align}
+\dot{\vect V}_b&=\frac{1}{m}\left(\mathbf{R}^{\!\top}m\vect g
+-m\,\vect\omega\times\vect V_b+\sum\vect F\right)\\
+\dot{\vect\omega}&=\mathbf{J}^{-1}\left(\sum\vect M-\vect\omega\times\mathbf{J}\vect\omega\right),
+\qquad
+\mathbf{J}=\begin{bmatrix}
+I_{xx}&0&-I_{xz}\\ 0&I_{yy}&0\\ -I_{xz}&0&I_{zz}
+\end{bmatrix}\\
+\dot{\vect\Lambda}&=\tfrac12\,\Omega(\vect\omega)\,\vect\Lambda
+\qquad\text{(quaternion kinematics)}
+\end{align}
+
+\noindent
+The coupling that prevents any block being evaluated independently is the chain
+\begin{equation*}
+T_f \;\longrightarrow\; \varepsilon,\ \bar q_w
+\;\longrightarrow\; \alpha_w \;\longrightarrow\; C_L
+\;\longrightarrow\; M_y \;\longrightarrow\; \text{attitude}
+\;\longrightarrow\; \vect V_b \;\longrightarrow\; V_{ax,i},\ \alpha,
+\end{equation*}
+which closes through the rotor inflow and the wing incidence simultaneously.
+
+\end{document}

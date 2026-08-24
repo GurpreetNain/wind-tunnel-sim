@@ -1,0 +1,17 @@
+{
+  "simulation": {
+    "time_step": 0.002
+  },
+  "atmosphere": {
+    "air_density": 1.225,
+    "drag_coefficients": {
+      "translational": [0.1, 0.1, 0.15],
+      "rotational": [0.01, 0.01, 0.01]
+    },
+    "wind_turbulence": {
+      "model": "none",
+      "W20_turbulence": 10
+    }
+  },
+  "gravity": [0, 0, 9.81]
+}
